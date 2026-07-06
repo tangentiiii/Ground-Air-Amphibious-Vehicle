@@ -75,8 +75,8 @@ TIM_HandleTypeDef htim3;
 // 非阻塞测距参数
 #define US_SAMPLE_INTERVAL_MS 100U  //每100ms触发一次测距；不要太频繁，否则超声波余波会互相干扰
 #define US_TIMEOUT_US 12000U        //12ms约对应2m量级往返时间；避障只关心近距离，不需要等30ms
-#define OBSTACLE_STOP_CM 25.0f      //小于此距离，禁止继续前进
-#define OBSTACLE_RELEASE_CM 35.0f   //大于此距离，解除避障；形成迟滞，避免临界抖动
+#define OBSTACLE_STOP_CM 15.0f      //小于此距离，禁止继续前进
+#define OBSTACLE_RELEASE_CM 25.0f   //大于此距离，解除避障；形成迟滞，避免临界抖动
 #define FORWARD_CMD_THRESHOLD 0.05f //油门大于这个值才认为是在主动前进
 
 #define US_STATE_IDLE      0
@@ -118,7 +118,7 @@ static float right_now = 0.0f;
 // HC-SR04 非阻塞测距相关变量
 volatile float us_distance_cm = -1.0f;       //最近一次有效/无效距离；-1表示本次测距超时或无效
 volatile uint8_t obstacle_blocked = 0;       //1表示前方距离过近，禁止继续前进
-volatile uint8_t us_state = US_STATE_IDLE;  //超声波测距状态机
+volatile uint8_t us_state = US_STATE_IDLE;  //超声波测距状态机，有IDLE, WAIT_RISE, WAIT_FALL, DONE四种状态
 volatile uint16_t us_echo_start = 0;         //Echo上升沿时间
 volatile uint16_t us_echo_width = 0;         //Echo高电平宽度，单位us
 volatile uint32_t us_measure_count = 0;      //debug：成功测距次数
@@ -159,9 +159,9 @@ static void rc_update_from_exti(uint8_t ch_index,
                                 uint16_t pin);
 
 // HC-SR04 非阻塞测距
-static void delay_us(uint16_t us);
-static void hcsr04_start_measurement(void);
-static void hcsr04_task(uint32_t now_ms);
+static void delay_us(uint16_t us); //短暂阻塞（10us）左右，用于产生10us的Trig信号；不会对电机控制产生太大的影响
+static void hcsr04_start_measurement(void);//触发一次10us的Trig信号
+static void hcsr04_task(uint32_t now_ms);//在主循环中调用的HC-SR04非阻塞测距任务：只负责触发测距、处理完成/超时，不会等待Echo，因此不会卡住电机控制
 static void hcsr04_echo_exti_callback(void);
 static void obstacle_update_from_distance(float distance_cm);
 
@@ -709,7 +709,7 @@ static void obstacle_update_from_distance(float distance_cm)
   }
 }
 
-static void hcsr04_start_measurement(void)
+static void hcsr04_start_measurement(void) //触发一次10us的Trig信号
 {
   //如果上一次测距还没结束，不要重复触发
   if (us_state == US_STATE_WAIT_RISE || us_state == US_STATE_WAIT_FALL)
@@ -738,32 +738,35 @@ static void hcsr04_task(uint32_t now_ms)
   float distance;
 
   __disable_irq();
-  state_snapshot = us_state;
-  width_snapshot = us_echo_width;
+  state_snapshot = us_state; //拿到当前状态
+  width_snapshot = us_echo_width; //拿到上一次echo信号宽度
   __enable_irq();
 
   if (state_snapshot == US_STATE_DONE)
   {
+	 //如果刚刚完成测距
     distance = (float)width_snapshot / 58.0f;
-    us_distance_cm = distance;
+    us_distance_cm = distance; //计算距离
     us_measure_count++;
-    obstacle_update_from_distance(distance);
+    obstacle_update_from_distance(distance);//更新“是否被阻挡的状态”
 
     __disable_irq();
-    us_state = US_STATE_IDLE;
+    us_state = US_STATE_IDLE;//更新状态为空闲
     __enable_irq();
 
-    us_last_sample_ms = now_ms;
+    us_last_sample_ms = now_ms; //更新 上一次采样时间 为当前时间
     return;
   }
 
   if (state_snapshot == US_STATE_WAIT_RISE || state_snapshot == US_STATE_WAIT_FALL)
   {
+	//如果正在等待echo信号的上升沿或者下降沿：几乎什么都不用干，但是需要看一下是否超时了
     uint16_t now_us = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
     uint16_t elapsed_us = (uint16_t)(now_us - us_trigger_time);
 
     if (elapsed_us > US_TIMEOUT_US)
     {
+    	//失效处理
       us_distance_cm = -1.0f;
       us_timeout_count++;
       obstacle_update_from_distance(-1.0f);
@@ -780,6 +783,7 @@ static void hcsr04_task(uint32_t now_ms)
 
   if ((uint32_t)(now_ms - us_last_sample_ms) >= US_SAMPLE_INTERVAL_MS)
   {
+	//又到了新一轮的采样时间
     hcsr04_start_measurement();
   }
 }
